@@ -1,6 +1,13 @@
 #pragma once
 #include "common.h"
 
+#define SATP_SV32 (1u << 31)
+#define PAGE_V (1 << 0)
+#define PAGE_R (1 << 1)
+#define PAGE_W (1 << 2)
+#define PAGE_X (1 << 3)
+#define PAGE_U (1 << 4)
+
 #define PROCS_MAX 8
 
 #define PROC_UNUSED 0
@@ -10,6 +17,7 @@ struct process {
   int pid;
   int state;
   vaddr_t sp;
+  uint32_t *page_table;
   uint8_t stack[8192];
 };
 
