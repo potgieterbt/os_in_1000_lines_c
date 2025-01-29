@@ -2,7 +2,7 @@
 #include "common.h"
 
 extern char __bss[], __bss_end[], __stack_top[], __free_ram[], __free_ram_end[],
-    __kernel_base[];
+    __kernel_base[], _binary_shell_bin_start[], _binary_shell_bin_size[];
 
 paddr_t alloc_pages(uint32_t n) {
   static paddr_t next_paddr = (paddr_t)__free_ram;
@@ -77,7 +77,16 @@ __attribute__((naked)) void switch_context(uint32_t *prev_sp,
 
 struct process procs[PROCS_MAX];
 
-struct process *create_process(uint32_t pc) {
+__attribute__((naked)) void user_entry(void) {
+  __asm__ __volatile__("csrw sepc, %[sepc]\n"
+                       "csrw sstatus, %[sstatus] \n"
+                       "sret \n"
+                       :
+                       : [sepc] "r"(USER_BASE), //
+                         [sstatus] "r"(SSTATUS_SPIE));
+}
+
+struct process *create_process(const void *image, size_t image_size) {
   struct process *proc = NULL;
   int i;
   for (i = 0; i < PROCS_MAX; i++) {
@@ -103,7 +112,7 @@ struct process *create_process(uint32_t pc) {
   *--sp = 0;
   *--sp = 0;
   *--sp = 0;
-  *--sp = (uint32_t)pc;
+  *--sp = (uint32_t)user_entry;
 
   uint32_t *page_table = (uint32_t *)alloc_pages(1);
   for (paddr_t paddr = (paddr_t)__kernel_base; paddr < (paddr_t)__free_ram_end;
@@ -111,20 +120,22 @@ struct process *create_process(uint32_t pc) {
     map_page(page_table, paddr, paddr, PAGE_R | PAGE_W | PAGE_X);
   }
 
+  for (uint32_t off = 0; off < image_size; off += PAGE_SIZE) {
+    paddr_t page = alloc_pages(1);
+
+    size_t remaining = image_size - off;
+    size_t copy_size = PAGE_SIZE <= remaining ? PAGE_SIZE : remaining;
+
+    memcpy((void *)page, image + off, copy_size);
+    map_page(page_table, USER_BASE + off, page,
+             PAGE_U | PAGE_R | PAGE_W | PAGE_X);
+  }
+
   proc->pid = i + 1;
   proc->state = PROC_RUNNABLE;
   proc->sp = (uint32_t)sp;
   proc->page_table = page_table;
   return proc;
-}
-
-void handle_trap(struct trap_frame *f) {
-  uint32_t scause = READ_CSR(scause);
-  uint32_t stval = READ_CSR(stval);
-  uint32_t user_pc = READ_CSR(sepc);
-
-  PANIC("unexpected trap scause=%x, stval=%x, sepc=%x\n", scause, stval,
-        user_pc);
 }
 
 __attribute__((naked)) __attribute__((aligned(4))) void kernel_entry(void) {
@@ -208,6 +219,34 @@ __attribute__((naked)) __attribute__((aligned(4))) void kernel_entry(void) {
 struct process *current_proc;
 struct process *idle_proc;
 
+struct sbiret sbi_call(long arg0, long arg1, long arg2, long arg3, long arg4,
+                       long arg5, long fid, long eid) {
+  register long a0 __asm__("a0") = arg0;
+  register long a1 __asm__("a1") = arg1;
+  register long a2 __asm__("a2") = arg2;
+  register long a3 __asm__("a3") = arg3;
+  register long a4 __asm__("a4") = arg4;
+  register long a5 __asm__("a5") = arg5;
+  register long a6 __asm__("a6") = fid;
+  register long a7 __asm__("a7") = eid;
+
+  __asm__ __volatile__("ecall"
+                       : "=r"(a0), "=r"(a1)
+                       : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(a5), "r"(a6),
+                         "r"(a7)
+                       : "memory");
+  return (struct sbiret){.error = a0, .value = a1};
+}
+
+void putchar(char ch) {
+  sbi_call(ch, 0, 0, 0, 0, 0, 0, 1 /* Console Putchar */);
+}
+
+long getchar(void) {
+  struct sbiret ret = sbi_call(0, 0, 0, 0, 0, 0, 0, 2);
+  return ret.error;
+}
+
 void yield(void) {
   struct process *next = idle_proc;
   for (int i = 0; i < PROCS_MAX; i++) {
@@ -262,32 +301,59 @@ void proc_b_entry(void) {
   }
 }
 
+void handle_syscall(struct trap_frame *f) {
+  switch (f->a3) {
+  case SYS_PUTCHAR:
+    putchar(f->a0);
+    break;
+  case SYS_GETCHAR:
+    while (1) {
+      long ch = getchar();
+      if (ch >= 0) {
+        f->a0 = ch;
+        break;
+      }
+      yield();
+    }
+    break;
+  case SYS_EXIT:
+    printf("process %d exited\n", current_proc->pid);
+    current_proc->state = PROC_EXITED;
+    yield();
+    PANIC("unreachable");
+  default:
+    PANIC("unexpected syscall a3=%x\n", f->a3);
+  }
+}
+
+void handle_trap(struct trap_frame *f) {
+  uint32_t scause = READ_CSR(scause);
+  uint32_t stval = READ_CSR(stval);
+  uint32_t user_pc = READ_CSR(sepc);
+
+  if (scause == SCAUSE_ECALL) {
+    handle_syscall(f);
+    user_pc += 4;
+  } else {
+    PANIC("unexpected trap scause=%x, stval=%x, sepc=%x\n", scause, stval,
+          user_pc);
+  }
+
+  WRITE_CSR(sepc, user_pc);
+}
+
 void kernel_main(void) {
   memset(__bss, 0, (size_t)__bss_end - (size_t)__bss);
 
-  paddr_t paddr0 = alloc_pages(2);
-  paddr_t paddr1 = alloc_pages(1);
-  printf("alloc_pages test: paddr0=%x\n", paddr0);
-  printf("alloc_pages test: paddr0=%x\n", paddr1);
-
   WRITE_CSR(stvec, (uint32_t)kernel_entry);
 
-  idle_proc = create_process((uint32_t)proc_a_entry);
+  idle_proc = create_process(NULL, 0);
   idle_proc->pid = -1;
   current_proc = idle_proc;
 
-  proc_a = create_process((uint32_t)proc_a_entry);
-  proc_b = create_process((uint32_t)proc_b_entry);
-  printf("just before yield");
+  create_process(_binary_shell_bin_start, (size_t)_binary_shell_bin_size);
   yield();
   PANIC("switch to idle process");
-  proc_a_entry();
-  __asm__ __volatile__("unimp");
-
-  PANIC("booted!");
-  printf("unreachable here!");
-  for (;;)
-    __asm__ __volatile__("wfi");
 }
 
 __attribute__((section(".text.boot"))) __attribute__((naked)) void boot(void) {
